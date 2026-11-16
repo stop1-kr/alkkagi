@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>알까기</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #2b2118;
+    color: #f5ecd9;
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body { display: flex; flex-direction: column; align-items: center; }
+  header {
+    width: 100%;
+    max-width: 900px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 12px 4px;
+  }
+  h1 { font-size: 20px; letter-spacing: 1px; }
+  .score { display: flex; gap: 14px; font-size: 17px; font-weight: 700; }
+  .score span { display: flex; align-items: center; gap: 6px; }
+  .dot { width: 16px; height: 16px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.black { background: #111; border: 1px solid #777; }
+  .dot.white { background: #f4f4f4; border: 1px solid #999; }
+  button {
+    font: inherit;
+    font-size: 14px;
+    padding: 7px 12px;
+    border-radius: 8px;
+    border: 1px solid #c9a86a;
+    background: #3b2e22;
+    color: #f5ecd9;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  button:active { background: #4d3c2c; }
+  #status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+    height: 34px;
+    padding: 0 12px 6px;
+    white-space: nowrap;
+  }
+  #stage { position: relative; }
+  canvas { display: block; touch-action: none; border-radius: 6px; }
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    background: rgba(20, 14, 8, 0.62);
+    border-radius: 6px;
+  }
+  #overlay.show { display: flex; }
+  #overlay p { font-size: 34px; font-weight: 800; }
+  #overlay button { font-size: 18px; padding: 10px 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>알까기</h1>
+  <div class="score">
+    <span><i class="dot black"></i><b id="blackCount">8</b></span>
+    <span><i class="dot white"></i><b id="whiteCount">8</b></span>
+  </div>
+  <button id="restartBtn">다시 시작</button>
+</header>
+<div id="status"></div>
+<div id="stage">
+  <canvas id="board"></canvas>
+  <div id="overlay">
+    <p id="resultText"></p>
+    <button id="againBtn">한 판 더</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // =========================================================
+  // 1. 조절 가능한 설정값 (게임 느낌을 바꾸고 싶으면 여기만 수정)
+  // =========================================================
+  const BOARD = 1000;          // 판의 내부 좌표 크기 (화면 크기와 무관)
+  const LINES = 19;            // 바둑판 줄 수
+  const MARGIN = 50;           // 판 가장자리 ~ 첫 줄 사이 여백
+  const CELL = (BOARD - MARGIN * 2) / (LINES - 1);
+  const RADIUS = 22;           // 돌 반지름
+  const FRICTION = 900;        // 마찰: 클수록 빨리 멈춤
+  const DAMPING = 0.8;         // 속도에 비례하는 감속 (빠를 때 더 많이 줄어듦)
+  const RESTITUTION = 0.92;    // 탄성: 1이면 완전 탄성, 작을수록 덜 튕김
+  const MAX_DRAG = 250;        // 이만큼 당기면 최대 힘
+  const MAX_SPEED = 2200;      // 최대 힘일 때 발사 속도
+  const MIN_DRAG = 12;         // 이보다 짧게 당기면 발사 취소
+  const STOP_SPEED = 5;        // 이 속도 이하면 멈춘 것으로 처리
+  const DT = 1 / 240;          // 물리 계산 간격 (고정 → 기기마다 같은 결과)
+  const NAME = { black: "흑", white: "백" };
+
+  // =========================================================
+  // 2. 화면 요소
+  // =========================================================
+  const canvas = document.getElementById("board");
+  const ctx = canvas.getContext("2d");
+  const stage = document.getElementById("stage");
+  const headerEl = document.querySelector("header");
+  const statusEl = document.getElementById("status");
+  const blackCountEl = document.getElementById("blackCount");
+  const whiteCountEl = document.getElementById("whiteCount");
+  const overlay = document.getElementById("overlay");
+  const resultText = document.getElementById("resultText");
+  const restartBtn = document.getElementById("restartBtn");
+  const againBtn = document.getElementById("againBtn");
+
+  // =========================================================
+  // 3. 게임 상태
+  // =========================================================
+  let stones = [];
+  let turn = "black";      // 현재 차례
+  let phase = "aim";       // aim(조준 대기) | moving(돌 움직이는 중) | over(게임 끝)
+  let drag = null;         // 드래그 중인 정보
+  let uiDirty = false;
+
+  function gridPos(i) {
+    return MARGIN + i * CELL;
+  }
+
+  function makeStone(id, color, x, y) {
+    return { id: id, color: color, x: x, y: y, vx: 0, vy: 0, alive: true, fall: 0 };
+  }
+
+  function resetGame() {
+    stones = [];
+    const cols = [2, 4, 6, 8, 10, 12, 14, 16];
+    cols.forEach(function (c, k) {
+      stones.push(makeStone(k, "white", gridPos(c), gridPos(3)));
+    });
+    cols.forEach(function (c, k) {
+      stones.push(makeStone(8 + k, "black", gridPos(c), gridPos(15)));
+    });
+    turn = "black";
+    phase = "aim";
+    drag = null;
+    overlay.classList.remove("show");
+    updateUI();
+  }
+
+  function countAlive(color) {
+    let n = 0;
+    for (const s of stones) {
+      if (s.alive && s.color === color) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  // =========================================================
+  // 4. 물리 계산 (마찰 → 이동 → 충돌 → 판 밖 확인)
+  // =========================================================
+  function step(dt) {
+    // (1) 마찰을 적용하고 이동
+    for (const s of stones) {
+      if (!s.alive) {
+        if (s.fall > 0) {
+          s.x += s.vx * dt;
+          s.y += s.vy * dt;
+          s.fall = Math.max(0, s.fall - dt * 3);
+        }
+        continue;
+      }
+      const speed = Math.hypot(s.vx, s.vy);
+      if (speed === 0) {
+        continue;
+      }
+      const next = speed - (FRICTION + DAMPING * speed) * dt;
+      if (next <= STOP_SPEED) {
+        s.vx = 0;
+        s.vy = 0;
+      } else {
+        const k = next / speed;
+        s.vx *= k;
+        s.vy *= k;
+      }
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+    }
+
+    // (2) 돌끼리 충돌 (같은 무게의 탄성 충돌)
+    const minDist = RADIUS * 2;
+    for (let i = 0; i < stones.length; i++) {
+      const a = stones[i];
+      if (!a.alive) {
+        continue;
+      }
+      for (let j = i + 1; j < stones.length; j++) {
+        const b = stones[j];
+        if (!b.alive) {
+          continue;
+        }
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = Math.hypot(dx, dy);
+        if (dist >= minDist) {
+          continue;
+        }
+        if (dist === 0) {
+          dx = 1;
+          dy = 0;
+          dist = 1;
+        }
+        const nx = dx / dist;
+        const ny = dy / dist;
+
+        // 겹친 만큼 서로 밀어내기
+        const overlap = minDist - dist;
+        a.x -= nx * overlap / 2;
+        a.y -= ny * overlap / 2;
+        b.x += nx * overlap / 2;
+        b.y += ny * overlap / 2;
+
+        // 서로 다가오는 중일 때만 속도 교환
+        const rel = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+        if (rel > 0) {
+          const impulse = (1 + RESTITUTION) / 2 * rel;
+          a.vx -= impulse * nx;
+          a.vy -= impulse * ny;
+          b.vx += impulse * nx;
+          b.vy += impulse * ny;
+        }
+      }
+    }
+
+    // (3) 판 밖으로 나간 돌 제거 (돌 중심이 판 가장자리를 넘으면 탈락)
+    for (const s of stones) {
+      if (s.alive && (s.x < 0 || s.x > BOARD || s.y < 0 || s.y > BOARD)) {
+        s.alive = false;
+        s.fall = 1;
+        uiDirty = true;
+      }
+    }
+  }
+
+  function anyMoving() {
+    return stones.some(function (s) {
+      if (s.alive) {
+        return s.vx !== 0 || s.vy !== 0;
+      }
+      return s.fall > 0;
+    });
+  }
+
+  // =========================================================
+  // 5. 차례 진행
+  // =========================================================
+  // 돌 발사: 2단계(온라인)에서는 이 함수에 넘기는 값(id, vx, vy)만 상대에게 보내면 됨
+  function shoot(id, vx, vy) {
+    const s = stones.find(function (t) {
+      return t.id === id;
+    });
+    if (!s || !s.alive) {
+      return;
+    }
+    s.vx = vx;
+    s.vy = vy;
+    phase = "moving";
+    updateUI();
+  }
+
+  function endShot() {
+    const b = countAlive("black");
+    const w = countAlive("white");
+    if (b === 0 && w === 0) {
+      gameOver(null);
+      return;
+    }
+    if (b === 0) {
+      gameOver("white");
+      return;
+    }
+    if (w === 0) {
+      gameOver("black");
+      return;
+    }
+    turn = turn === "black" ? "white" : "black";
+    phase = "aim";
+    updateUI();
+  }
+
+  function gameOver(winner) {
+    phase = "over";
+    resultText.textContent = winner ? NAME[winner] + " 승리!" : "무승부";
+    overlay.classList.add("show");
+    updateUI();
+  }
+
+  function updateUI() {
+    blackCountEl.textContent = countAlive("black");
+    whiteCountEl.textContent = countAlive("white");
+    if (phase === "aim") {
+      statusEl.innerHTML = '<i class="dot ' + turn + '"></i><b>' + NAME[turn] + " 차례</b> · 돌을 뒤로 당겼다 놓기";
+    } else if (phase === "moving") {
+      statusEl.textContent = "돌이 움직이는 중…";
+    } else {
+      statusEl.textContent = "게임 종료";
+    }
+  }
+
+  // =========================================================
+  // 6. 입력 (마우스·터치 공통: Pointer Events)
+  // =========================================================
+  function toBoard(e) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) / r.width * BOARD,
+      y: (e.clientY - r.top) / r.height * BOARD
+    };
+  }
+
+  function getLaunch(d) {
+    // 당긴 방향의 반대쪽으로 발사
+    const dx = d.sx - d.cx;
+    const dy = d.sy - d.cy;
+    const len = Math.hypot(dx, dy);
+    if (len < MIN_DRAG) {
+      return null;
+    }
+    return {
+      nx: dx / len,
+      ny: dy / len,
+      power: Math.min(len, MAX_DRAG) / MAX_DRAG
+    };
+  }
+
+  canvas.addEventListener("pointerdown", function (e) {
+    if (phase !== "aim" || drag) {
+      return;
+    }
+    const p = toBoard(e);
+    const hitR = RADIUS * (e.pointerType === "touch" ? 2 : 1.3);  // 손가락은 더 넓게 인식
+    let best = null;
+    let bestD = Infinity;
+    for (const s of stones) {
+      if (!s.alive || s.color !== turn) {
+        continue;
+      }
+      const d = Math.hypot(s.x - p.x, s.y - p.y);
+      if (d < hitR && d < bestD) {
+        best = s;
+        bestD = d;
+      }
+    }
+    if (!best) {
+      return;
+    }
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);   // 판 밖까지 끌어도 계속 추적
+    drag = { stone: best, pointerId: e.pointerId, sx: p.x, sy: p.y, cx: p.x, cy: p.y };
+  });
+
+  canvas.addEventListener("pointermove", function (e) {
+    if (!drag || e.pointerId !== drag.pointerId) {
+      return;
+    }
+    const p = toBoard(e);
+    drag.cx = p.x;
+    drag.cy = p.y;
+  });
+
+  canvas.addEventListener("pointerup", function (e) {
+    if (!drag || e.pointerId !== drag.pointerId) {
+      return;
+    }
+    const launch = getLaunch(drag);
+    const stone = drag.stone;
+    drag = null;
+    if (!launch) {
+      return;
+    }
+    // 약한 힘을 섬세하게 조절할 수 있도록 곡선 적용
+    const speed = MAX_SPEED * Math.pow(launch.power, 1.3);
+    shoot(stone.id, launch.nx * speed, launch.ny * speed);
+  });
+
+  canvas.addEventListener("pointercancel", function () {
+    drag = null;
+  });
+
+  restartBtn.addEventListener("click", resetGame);
+  againBtn.addEventListener("click", resetGame);
+
+  // =========================================================
+  // 7. 그리기 (Canvas)
+  // =========================================================
+  function drawBoard() {
+    ctx.fillStyle = "#dcb35c";
+    ctx.fillRect(0, 0, BOARD, BOARD);
+    ctx.strokeStyle = "#8a6a2f";
+    ctx.lineWidth = 6;
+    ctx.strokeRect(3, 3, BOARD - 6, BOARD - 6);
+
+    ctx.strokeStyle = "#3a2a10";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < LINES; i++) {
+      const p = gridPos(i);
+      ctx.moveTo(MARGIN, p);
+      ctx.lineTo(BOARD - MARGIN, p);
+      ctx.moveTo(p, MARGIN);
+      ctx.lineTo(p, BOARD - MARGIN);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = "#3a2a10";
+    const stars = [3, 9, 15];
+    for (const i of stars) {
+      for (const j of stars) {
+        ctx.beginPath();
+        ctx.arc(gridPos(i), gridPos(j), 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawTurnRing(s, t) {
+    const alpha = 0.45 + 0.35 * Math.sin(t / 250);
+    ctx.strokeStyle = "rgba(230, 60, 30, " + alpha + ")";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, RADIUS + 6, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  function drawStone(s) {
+    const k = s.alive ? 1 : s.fall;
+    const r = RADIUS * (0.4 + 0.6 * k);
+    ctx.globalAlpha = k;
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.28)";
+    ctx.beginPath();
+    ctx.arc(s.x + 3, s.y + 4, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    const g = ctx.createRadialGradient(s.x - r * 0.35, s.y - r * 0.35, r * 0.1, s.x, s.y, r);
+    if (s.color === "black") {
+      g.addColorStop(0, "#6a6a6a");
+      g.addColorStop(1, "#050505");
+    } else {
+      g.addColorStop(0, "#ffffff");
+      g.addColorStop(1, "#c4c4c4");
+    }
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawAim(d) {
+    const s = d.stone;
+    const launch = getLaunch(d);
+    ctx.save();
+
+    // 손가락 쪽으로 당겨진 고무줄
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y);
+    ctx.lineTo(s.x + (d.cx - d.sx), s.y + (d.cy - d.sy));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (launch) {
+      // 발사 방향 화살표 (길이·색 = 힘)
+      const len = 60 + launch.power * 260;
+      const ex = s.x + launch.nx * len;
+      const ey = s.y + launch.ny * len;
+      const color = "hsl(" + (120 - 120 * launch.power) + ", 85%, 45%)";
+      const px = -launch.ny;
+      const py = launch.nx;
+
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 8;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(s.x + launch.nx * (RADIUS + 4), s.y + launch.ny * (RADIUS + 4));
+      ctx.lineTo(ex - launch.nx * 14, ey - launch.ny * 14);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(ex + launch.nx * 10, ey + launch.ny * 10);
+      ctx.lineTo(ex - launch.nx * 20 + px * 16, ey - launch.ny * 20 + py * 16);
+      ctx.lineTo(ex - launch.nx * 20 - px * 16, ey - launch.ny * 20 - py * 16);
+      ctx.closePath();
+      ctx.fill();
+
+      const label = Math.round(launch.power * 100) + "%";
+      const tx = ex + launch.nx * 45;
+      const ty = ey + launch.ny * 45;
+      ctx.font = "bold 30px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+      ctx.strokeText(label, tx, ty);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, tx, ty);
+    }
+    ctx.restore();
+  }
+
+  function draw(t) {
+    const scale = canvas.width / BOARD;
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    drawBoard();
+    if (phase === "aim") {
+      for (const s of stones) {
+        if (s.alive && s.color === turn) {
+          drawTurnRing(s, t);
+        }
+      }
+    }
+    for (const s of stones) {
+      if (s.alive || s.fall > 0) {
+        drawStone(s);
+      }
+    }
+    if (drag) {
+      drawAim(drag);
+    }
+  }
+
+  // =========================================================
+  // 8. 반응형 화면 크기
+  // =========================================================
+  function resize() {
+    const used = headerEl.offsetHeight + statusEl.offsetHeight;
+    const size = Math.max(200, Math.floor(Math.min(window.innerWidth - 16, window.innerHeight - used - 12, 900)));
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);   // 레티나 화면에서도 선명하게
+    stage.style.width = size + "px";
+    stage.style.height = size + "px";
+    canvas.style.width = size + "px";
+    canvas.style.height = size + "px";
+    canvas.width = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+
+  // =========================================================
+  // 9. 게임 루프 (1초에 약 60번 반복)
+  // =========================================================
+  let last = performance.now();
+  let acc = 0;
+  function frame(now) {
+    const elapsed = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (phase === "moving") {
+      acc += elapsed;
+      while (acc >= DT) {
+        step(DT);
+        acc -= DT;
+      }
+      if (uiDirty) {
+        uiDirty = false;
+        updateUI();
+      }
+      if (!anyMoving()) {
+        acc = 0;
+        endShot();
+      }
+    } else {
+      acc = 0;
+    }
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  // =========================================================
+  // 10. 2단계(온라인 대전)용 연결 지점
+  // =========================================================
+  function getState() {
+    return {
+      turn: turn,
+      stones: stones.map(function (s) {
+        return { id: s.id, color: s.color, x: s.x, y: s.y, alive: s.alive };
+      })
+    };
+  }
+
+  function setState(state) {
+    turn = state.turn;
+    stones = state.stones.map(function (s) {
+      const st = makeStone(s.id, s.color, s.x, s.y);
+      st.alive = s.alive;
+      return st;
+    });
+    phase = "aim";
+    drag = null;
+    updateUI();
+  }
+
+  window.alkkagi = { shoot: shoot, getState: getState, setState: setState };
+
+  resetGame();
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
